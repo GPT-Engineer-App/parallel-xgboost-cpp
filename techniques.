@@ -1,0 +1,149 @@
+#include <iostream>
+#include <vector>
+#include <omp.h>
+#include <cmath>
+#include <algorithm>
+
+// Define a structure for a decision tree node
+struct TreeNode {
+    int feature_index;
+    double threshold;
+    double value;
+    TreeNode* left;
+    TreeNode* right;
+
+    TreeNode() : feature_index(-1), threshold(0.0), value(0.0), left(nullptr), right(nullptr) {}
+};
+
+// Function to calculate the gradient and hessian
+void calculate_gradient_hessian(const std::vector<double>& y, const std::vector<double>& y_pred, std::vector<double>& gradient, std::vector<double>& hessian) {
+    int n = y.size();
+    #pragma omp parallel for
+    for (int i = 0; i < n; ++i) {
+        gradient[i] = y_pred[i] - y[i];
+        hessian[i] = 1.0; // Assuming a squared loss function
+    }
+}
+
+// Function to find the best split
+void find_best_split(const std::vector<std::vector<double>>& X, const std::vector<double>& gradient, const std::vector<double>& hessian, int& best_feature, double& best_threshold, double& best_gain) {
+    int n = X.size();
+    int m = X[0].size();
+    best_gain = -1.0;
+
+    #pragma omp parallel for collapse(2)
+    for (int j = 0; j < m; ++j) {
+        for (int i = 0; i < n; ++i) {
+            double threshold = X[i][j];
+            double left_gradient_sum = 0.0, right_gradient_sum = 0.0;
+            double left_hessian_sum = 0.0, right_hessian_sum = 0.0;
+
+            for (int k = 0; k < n; ++k) {
+                if (X[k][j] <= threshold) {
+                    left_gradient_sum += gradient[k];
+                    left_hessian_sum += hessian[k];
+                } else {
+                    right_gradient_sum += gradient[k];
+                    right_hessian_sum += hessian[k];
+                }
+            }
+
+            double gain = (left_gradient_sum * left_gradient_sum) / (left_hessian_sum + 1e-6) + (right_gradient_sum * right_gradient_sum) / (right_hessian_sum + 1e-6);
+
+            #pragma omp critical
+            {
+                if (gain > best_gain) {
+                    best_gain = gain;
+                    best_feature = j;
+                    best_threshold = threshold;
+                }
+            }
+        }
+    }
+}
+
+// Function to build a decision tree
+TreeNode* build_tree(const std::vector<std::vector<double>>& X, const std::vector<double>& y, const std::vector<double>& y_pred, int depth, int max_depth) {
+    if (depth >= max_depth) {
+        TreeNode* leaf = new TreeNode();
+        leaf->value = std::accumulate(y.begin(), y.end(), 0.0) / y.size();
+        return leaf;
+    }
+
+    std::vector<double> gradient(y.size()), hessian(y.size());
+    calculate_gradient_hessian(y, y_pred, gradient, hessian);
+
+    int best_feature;
+    double best_threshold, best_gain;
+    find_best_split(X, gradient, hessian, best_feature, best_threshold, best_gain);
+
+    if (best_gain < 1e-6) {
+        TreeNode* leaf = new TreeNode();
+        leaf->value = std::accumulate(y.begin(), y.end(), 0.0) / y.size();
+        return leaf;
+    }
+
+    std::vector<std::vector<double>> left_X, right_X;
+    std::vector<double> left_y, right_y, left_y_pred, right_y_pred;
+
+    for (int i = 0; i < X.size(); ++i) {
+        if (X[i][best_feature] <= best_threshold) {
+            left_X.push_back(X[i]);
+            left_y.push_back(y[i]);
+            left_y_pred.push_back(y_pred[i]);
+        } else {
+            right_X.push_back(X[i]);
+            right_y.push_back(y[i]);
+            right_y_pred.push_back(y_pred[i]);
+        }
+    }
+
+    TreeNode* node = new TreeNode();
+    node->feature_index = best_feature;
+    node->threshold = best_threshold;
+    node->left = build_tree(left_X, left_y, left_y_pred, depth + 1, max_depth);
+    node->right = build_tree(right_X, right_y, right_y_pred, depth + 1, max_depth);
+
+    return node;
+}
+
+// Function to predict using the decision tree
+double predict(TreeNode* node, const std::vector<double>& x) {
+    if (!node->left && !node->right) {
+        return node->value;
+    }
+
+    if (x[node->feature_index] <= node->threshold) {
+        return predict(node->left, x);
+    } else {
+        return predict(node->right, x);
+    }
+}
+
+// Main function to train the XGBoost model
+void train_xgboost(const std::vector<std::vector<double>>& X, const std::vector<double>& y, int max_depth, int n_estimators) {
+    int n = X.size();
+    std::vector<double> y_pred(n, 0.0);
+
+    for (int i = 0; i < n_estimators; ++i) {
+        TreeNode* tree = build_tree(X, y, y_pred, 0, max_depth);
+
+        #pragma omp parallel for
+        for (int j = 0; j < n; ++j) {
+            y_pred[j] += predict(tree, X[j]);
+        }
+    }
+}
+
+int main() {
+    // Example dataset
+    std::vector<std::vector<double>> X = {{1.0, 2.0}, {2.0, 3.0}, {3.0, 4.0}, {4.0, 5.0}};
+    std::vector<double> y = {1.0, 2.0, 3.0, 4.0};
+
+    int max_depth = 3;
+    int n_estimators = 10;
+
+    train_xgboost(X, y, max_depth, n_estimators);
+
+    return 0;
+}
